@@ -1,6 +1,6 @@
 # ERP Data Migration
 
-This tool copies data from an old ERP Excel file into a new Excel file that uses different column names.
+This tool copies data from an old ERP file into a new Excel file that uses different column names. The old file can be an Excel file (`.xlsx`) or a text file (`.txt`) exported from the old ERP.
 
 You write down which old column goes into which new column in `data_migration_helper.xlsx`. The tool then creates the new file and copies every value exactly as it is: dates stay dates, codes keep their leading zeros, and numbers are not rounded. Before it saves the new file, it checks every copied cell against the old file.
 
@@ -163,7 +163,7 @@ Delete the EXAMPLE rows before your first real run. Do not rename the Mapping sh
 python main.py
 ```
 
-The tool asks for the old file, the sheet (only if there is more than one), the row with the column names, the mapping file and the name of the new file. To give a file, drag it from File Explorer into the black window and press Enter. To accept the suggestion shown in [brackets], just press Enter. At the end, it shows your answers and waits for Enter before it starts.
+The tool asks for the old file (`.xlsx` or `.txt`), the sheet (only if an Excel file has more than one), the row with the column names, the mapping file and the name of the new file. To give a file, drag it from File Explorer into the black window and press Enter. To accept the suggestion shown in [brackets], just press Enter. At the end, it shows your answers and waits for Enter before it starts.
 
 **Way B: give the paths in the command.** Type everything in one line:
 
@@ -171,14 +171,14 @@ The tool asks for the old file, the sheet (only if there is more than one), the 
 python main.py --old "C:\Data\old_data.xlsx" --output "C:\Data\new_data.xlsx"
 ```
 
-- `--old` is the old file with the data.
+- `--old` is the old file with the data: an Excel file (`.xlsx`) or a text file (`.txt`). For a text file, see [If the old file is a text file](#if-the-old-file-is-a-text-file-txt).
 - `--output` is the new file to create.
 - Put "quotes" around every path.
 - To get a file's path, right-click the file in File Explorer and choose **Copy as path**. On older Windows, hold Shift while you right-click. Then paste it into the black window with a right-click or Ctrl+V.
 
 Add these only when needed:
 
-- `--sheet "Customers"`: the old file has more than one sheet. Give the name of the sheet (the tab at the bottom in Excel) that has the data.
+- `--sheet "Customers"`: the old Excel file has more than one sheet. Give the name of the sheet (the tab at the bottom in Excel) that has the data. A text file has no sheets, so leave this out.
 - `--header-row 3`: the column names in the old file are not in row 1. Give the row number.
 - `--helper "C:\Data\other_mapping.xlsx"`: use another mapping file instead of `data_migration_helper.xlsx` in the tool's folder.
 - `--new-sheet "Import"`: the name of the sheet in the new file. The default is `Sheet1`.
@@ -213,6 +213,27 @@ Old columns NOT migrated (not in the helper): Sales Rep, Internal Notes
 - **Always read the "NOT migrated" list.** These old columns are not in the new file because they are not in the mapping. Make sure that is what you want.
 - Open the new file and look at a few rows.
 
+### If the old file is a text file (.txt)
+
+The old ERP can also give its data as a text file, for example `CUSTOMER.TXT`. Use it like an Excel file: drag it into the window when the tool asks for the old file, or give it with `--old`:
+
+```
+python main.py --old "C:\Data\CUSTOMER.TXT" --output "C:\Data\new_customers.xlsx"
+```
+
+The text file must be like this:
+
+- The values on each line are separated by tabs.
+- The column names are on the first line. If they are on another line, use `--header-row`, as with an Excel file.
+- A value in "double quotes" can contain tabs and line breaks, for example an address on several lines. It is still one value, and its row is still one row.
+- The file is saved as UTF-8. Excel's "Unicode Text" files work too. If the tool says the file is not saved as UTF-8, see [If you see an error](#if-you-see-an-error).
+
+What to expect in the new file:
+
+- Every value is copied as text, exactly as it is written in the text file. Codes keep their leading zeros. Numbers and dates are also copied as text, because a text file does not say which values are numbers or dates. Excel may show a small green triangle on numbers stored as text. That is expected.
+- Line breaks inside a value are saved as normal Excel line breaks. The summary then has an extra line: `Note: 1 copied cell has text on several lines (for example an address); the line breaks were saved as Excel line breaks. The text itself is unchanged.`
+- Messages give positions as for an Excel file: `C14` is the third value (column C) of row 14. Messages about a broken row also give its line number. To find that line in Notepad, press Ctrl+G, type the number and press Enter.
+
 
 ## If you see an error
 
@@ -229,6 +250,15 @@ When the tool stops with an error, it creates nothing. Fix the problem and run i
 - **"cannot open ... as an .xlsx file"**: the file is an old `.xls` file or is damaged. Open it in Excel and use **Save As** with the type **Excel Workbook (.xlsx)**.
 - **"formulas whose result was never saved"**: open the old file in Excel, save it, close it, and run again.
 - **"Permission denied ... Close the file if it is open in Excel"**: the new file is open in Excel. Close it and run again.
+
+Only with a text file (`.txt`):
+
+- **"... is not saved as UTF-8 text"**: open the text file in Notepad, choose **File > Save as**, set **Encoding** (at the bottom) to **UTF-8**, save it under a new name, for example `CUSTOMER_utf8.txt`, and run again with the new file.
+- **"these rows do not have the same number of values as row 1"**: a value in those rows has a tab or a line break without "quotes" around it, so its row was cut into pieces or its values moved to the wrong columns. The message gives the line numbers. Export the file again from the old ERP, or fix those lines in Notepad.
+- **"cannot read the row that starts on line N"**: a value in that row starts with a `"` quote but does not end with one. Look at that line in Notepad.
+- **"have more than 32,767 characters"** or **"contain control characters"**: a value is too long for an Excel cell, or has invisible special characters that Excel cannot store. Fix that value in the text file, or leave its column out of the mapping.
+- **"more rows than an Excel sheet can hold"**: one Excel sheet holds at most 1,048,576 rows. Split the text file into smaller files and migrate each one.
+- **"--sheet is only for Excel files"**: leave out `--sheet` when the old file is a text file.
 
 
 ## Practice with the test files
