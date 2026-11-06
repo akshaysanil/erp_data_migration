@@ -7,14 +7,20 @@ in the same order. The column is filled with an exact copy of the data under
 the matching "Old Column" of the old file: values and their number formats,
 so dates stay dates, codes keep their leading zeros, decimals are unchanged.
 
+The old file can also be a tab-separated .txt file, read the way Excel opens
+one (a value in "quotes" may contain tabs and line breaks). All its values are
+text and are copied as text, unchanged, except that a Windows line break inside
+a value is saved as an Excel line break.
+
 Usage:
     python main.py --old old_data.xlsx --output new_data.xlsx
+    python main.py --old old_data.txt --output new_data.xlsx
     python main.py          (no options: asks for everything step by step)
     python main.py --help   (explains every option)
 
 Options:
     --helper       mapping workbook (default: data_migration_helper.xlsx next to this script)
-    --sheet        sheet of the old file to read (required only if it has several sheets)
+    --sheet        sheet of the old .xlsx file to read (required only if it has several sheets)
     --header-row   row number that holds the column names in the old file (default: 1)
     --new-sheet    sheet name for the new file (default: Sheet1)
     --overwrite    replace the output file if it already exists
@@ -30,17 +36,21 @@ Safety:
 from __future__ import annotations
 
 import argparse
+import codecs
+import csv
 import difflib
 import os
 import sys
 import warnings
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import zip_longest
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell import WriteOnlyCell
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.cell.read_only import EMPTY_CELL
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.exceptions import InvalidFileException
@@ -49,6 +59,9 @@ MAPPING_SHEET = "Mapping"
 NEW_COL_HEADER = "New Column"
 OLD_COL_HEADER = "Old Column"
 MAX_LISTED = 20  # cap on cell positions listed in one error message
+OLD_FILE_TYPES = (".xlsx", ".txt")
+EXCEL_MAX_ROWS = 1_048_576  # rows in one Excel sheet
+EXCEL_MAX_TEXT = 32_767  # characters in one Excel cell
 
 
 class MigrationError(Exception):
@@ -119,6 +132,139 @@ def pick_sheet(wb, path, sheet_name):
     # Forget it so every row actually present in the file is read.
     ws.reset_dimensions()
     return ws
+
+
+def is_text_file(path):
+    return path.suffix.lower() == ".txt"
+
+
+class TextCell:
+    """A value read from a .txt file, shaped like a cell read by openpyxl. It is always text."""
+
+    __slots__ = ("value", "had_cr")
+    data_type = "s"
+    number_format = "General"
+
+    def __init__(self, raw):
+        # openpyxl cannot store a carriage return (\r) in a cell: the saved file reads back
+        # with \n instead. So a Windows line break inside a value (\r\n, or \r alone) is
+        # written as \n, which is Excel's own line break inside a cell. Nothing else changes.
+        self.had_cr = "\r" in raw
+        self.value = raw.replace("\r\n", "\n").replace("\r", "\n") if self.had_cr else raw
+
+
+SAVE_AS_UTF8 = (
+    "  Open it in Notepad, choose File > Save as, set Encoding to UTF-8, save it under a new name, "
+    "and run again with the new file."
+)
+
+
+def text_encoding(path):
+    """UTF-16 if the file starts with its byte-order mark (Excel's "Unicode Text"), else UTF-8."""
+    with open(path, "rb") as f:
+        start = f.read(4096)
+    if start[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
+        return "utf-16"
+    if b"\x00" in start:
+        # Not readable UTF-8 text: usually Unicode saved without its marker, or not a text file.
+        raise MigrationError(f"{path} is not saved as UTF-8 text, or is not a text file.\n" + SAVE_AS_UTF8)
+    return "utf-8-sig"  # UTF-8 with or without a byte-order mark
+
+
+def text_records(f, path):
+    """Yield (row number, line number, values) for each row of a tab-separated text file.
+
+    Read the way Excel opens such a file: a value in "double quotes" may contain tabs and
+    line breaks, and "" inside the quotes is one quote character. One row can therefore
+    span several lines; the line number is the one where the row starts.
+    """
+    reader = csv.reader(f, delimiter="\t", quotechar='"', doublequote=True, strict=True)
+    line = 1
+    try:
+        for row_no, values in enumerate(reader, start=1):
+            yield row_no, line, values
+            line = reader.line_num + 1
+    except UnicodeDecodeError:
+        raise MigrationError(
+            f"{path} is not saved as UTF-8 text, so some of its letters cannot be read exactly.\n" + SAVE_AS_UTF8
+        ) from None
+    except csv.Error as exc:
+        detail = str(exc).replace("\t", "tab")
+        raise MigrationError(
+            f"cannot read the row that starts on line {line} of {path} ({detail}).\n"
+            '  Usually a value in that row starts with a " quote but does not end with one, '
+            "or has more text right after its closing quote."
+        ) from None
+
+
+def text_rows(records, path, width, header_row):
+    """Turn the rows below the header into rows of cells.
+
+    Every row with data must have as many values as the header row. Otherwise a value had
+    a tab or a line break without quotes around it, and its row was split or shifted.
+    """
+    wrong = []
+    for row_no, line, values in records:
+        if any(values) and len(values) != width:
+            wrong.append(f"row {row_no} (line {line})")
+        yield tuple(TextCell(v) if v else EMPTY_CELL for v in values)
+    if wrong:
+        raise MigrationError(
+            f"in {path}, these rows do not have the same number of values as row {header_row} "
+            f"(the column names, {width} values): {listed(wrong)}.\n"
+            '  Usually a value in the row contains a tab or a line break without "quotes" around it, '
+            "so the row was split. Export the file again or fix those rows, and run again."
+        )
+
+
+@contextmanager
+def old_rows(path, sheet_name, header_row, with_formulas=False):
+    """Open the old file and yield (header values, rows below the header).
+
+    Each row is a sequence of cells with .value, .data_type and .number_format. With
+    with_formulas=True each row is a (values, formulas) pair instead: for an .xlsx the second
+    row comes from the file opened without formula results, which tells which cells are
+    formulas. A .txt file has no formulas, so it gives the same row twice.
+    """
+    if is_text_file(path):
+        with open(path, encoding=text_encoding(path), newline="") as f:
+            records = text_records(f, path)
+            header = []
+            for row_no, _, values in records:
+                if row_no == header_row:
+                    header = values
+                    break
+            rows = text_rows(records, path, len(header), header_row)
+            yield header, (((row, row) for row in rows) if with_formulas else rows)
+        return
+
+    values_wb = open_workbook(path, data_only=True)  # what Excel shows (formula results)
+    formulas_wb = None
+    try:
+        values_ws = pick_sheet(values_wb, path, sheet_name)
+        header = next(values_ws.iter_rows(min_row=header_row, max_row=header_row, values_only=True), ())
+        rows = values_ws.iter_rows(min_row=header_row + 1)
+        if with_formulas:
+            formulas_wb = open_workbook(path, data_only=False)  # to detect formulas
+            formulas_ws = pick_sheet(formulas_wb, path, sheet_name)
+            rows = zip(rows, formulas_ws.iter_rows(min_row=header_row + 1))
+        yield header, rows
+    finally:
+        values_wb.close()
+        if formulas_wb is not None:
+            formulas_wb.close()
+
+
+def old_file_sheets(path):
+    """Sheet names of an old .xlsx file, or [] for a .txt file. Raises MigrationError if unreadable."""
+    if is_text_file(path):
+        with old_rows(path, None, 1):
+            pass  # reads the first row, so a file that is not readable text fails here
+        return []
+    wb = open_workbook(path)
+    sheets = wb.sheetnames
+    wb.close()
+    return sheets
 
 
 def read_mapping(helper_path):
@@ -215,14 +361,10 @@ def copy_cell(out_ws, src):
 def write_new_file(old_path, sheet_name, header_row, mappings, out_ws):
     """Copy the mapped columns into out_ws.
 
-    Returns (rows written, formula cells copied, old columns not migrated, unnamed columns with data).
+    Returns (rows written, formula cells copied, cells whose line breaks became Excel line
+    breaks, old columns not migrated, unnamed columns with data).
     """
-    values_wb = open_workbook(old_path, data_only=True)  # what Excel shows (formula results)
-    formulas_wb = open_workbook(old_path, data_only=False)  # to detect formulas
-    try:
-        values_ws = pick_sheet(values_wb, old_path, sheet_name)
-        formulas_ws = pick_sheet(formulas_wb, old_path, sheet_name)
-        old_header = next(values_ws.iter_rows(min_row=header_row, max_row=header_row, values_only=True), ())
+    with old_rows(old_path, sheet_name, header_row, with_formulas=True) as (old_header, rows):
         if not any(text(v) for v in old_header):
             raise MigrationError(f"row {header_row} of {old_path} is empty; set the right --header-row.")
         not_migrated = resolve_old_columns(mappings, old_header, header_row)
@@ -237,9 +379,9 @@ def write_new_file(old_path, sheet_name, header_row, mappings, out_ws):
         named = {i for i, v in enumerate(old_header) if text(v)}
         unnamed_with_data = set()
         formula_cells, formulas_without_result = 0, []
+        too_long, control_chars, line_break_cells = [], [], 0
         rows_written, pending_blank_rows = 0, 0
 
-        rows = zip(values_ws.iter_rows(min_row=header_row + 1), formulas_ws.iter_rows(min_row=header_row + 1))
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             for row_no, (vrow, frow) in enumerate(rows, start=header_row + 1):
@@ -250,9 +392,14 @@ def write_new_file(old_path, sheet_name, header_row, mappings, out_ws):
                     pending_blank_rows += 1
                     continue
                 unnamed_with_data.update(i for i in filled if i not in named)
+                rows_written += pending_blank_rows + 1
+                if rows_written >= EXCEL_MAX_ROWS:  # the header row takes one more
+                    raise MigrationError(
+                        f"the old file has more rows than an Excel sheet can hold ({EXCEL_MAX_ROWS:,} rows, "
+                        "including the column names). Split it into smaller files and migrate each one."
+                    )
                 for _ in range(pending_blank_rows):
                     out_ws.append([])
-                rows_written += pending_blank_rows + 1
                 pending_blank_rows = 0
 
                 out_row = []
@@ -265,12 +412,21 @@ def write_new_file(old_path, sheet_name, header_row, mappings, out_ws):
                         formula_cells += 1
                         if src.value is None:
                             formulas_without_result.append(cell_ref(m.old_index, row_no))
+                    if isinstance(src.value, str):
+                        # Only possible with a .txt file. Checked here because openpyxl's own
+                        # error for these would print the cell's contents.
+                        if len(src.value) > EXCEL_MAX_TEXT:
+                            too_long.append(cell_ref(m.old_index, row_no))
+                            out_row.append(None)
+                            continue
+                        if ILLEGAL_CHARACTERS_RE.search(src.value):
+                            control_chars.append(cell_ref(m.old_index, row_no))
+                            out_row.append(None)
+                            continue
+                        line_break_cells += getattr(src, "had_cr", False)
                     out_row.append(copy_cell(out_ws, src))
                 out_ws.append(out_row)
             bad_dates = [str(w.message) for w in caught if "outside the limits for dates" in str(w.message)]
-    finally:
-        values_wb.close()
-        formulas_wb.close()
 
     if formulas_without_result:
         raise MigrationError(
@@ -280,8 +436,20 @@ def write_new_file(old_path, sheet_name, header_row, mappings, out_ws):
         )
     if bad_dates:
         raise MigrationError("some date cells in the old file cannot be read exactly:\n  " + "\n  ".join(bad_dates))
+    if too_long:
+        raise MigrationError(
+            f"these cells of the old file have more than {EXCEL_MAX_TEXT:,} characters, the most "
+            f"an Excel cell can hold: {listed(too_long)}.\n"
+            "  Shorten those values in the old file, or leave that column out of the mapping."
+        )
+    if control_chars:
+        raise MigrationError(
+            "these cells of the old file contain control characters (invisible special characters) "
+            f"that an Excel file cannot store: {listed(control_chars)}.\n"
+            "  Remove those characters from the old file and run again."
+        )
     unnamed = sorted(get_column_letter(i + 1) for i in unnamed_with_data)
-    return rows_written, formula_cells, not_migrated, unnamed
+    return rows_written, formula_cells, line_break_cells, not_migrated, unnamed
 
 
 def same_cell(src, out):
@@ -297,10 +465,8 @@ def same_cell(src, out):
 
 def verify(old_path, sheet_name, header_row, mappings, new_path, rows_written):
     """Re-read both files and check every migrated cell. Returns the number of cells checked."""
-    src_wb = open_workbook(old_path, data_only=True)
     out_wb = open_workbook(new_path)
     try:
-        src_ws = pick_sheet(src_wb, old_path, sheet_name)
         out_ws = out_wb.worksheets[0]
         out_ws.reset_dimensions()
         out_rows = out_ws.iter_rows()
@@ -308,16 +474,18 @@ def verify(old_path, sheet_name, header_row, mappings, new_path, rows_written):
             raise MigrationError("verification failed: the header row of the new file is not as expected.")
 
         mismatches = []
-        src_rows = src_ws.iter_rows(min_row=header_row + 1)
-        for offset, (srow, orow) in enumerate(zip_longest(src_rows, out_rows, fillvalue=())):
-            for out_index, m in enumerate(mappings):
-                out = at(orow, out_index, EMPTY_CELL)
-                src = EMPTY_CELL if m.old_index is None else at(srow, m.old_index, EMPTY_CELL)
-                if not same_cell(src, out):
-                    old_ref = "(empty column)" if m.old_index is None else cell_ref(m.old_index, header_row + 1 + offset)
-                    mismatches.append(f"old {old_ref} -> new {cell_ref(out_index, offset + 2)}")
+        with old_rows(old_path, sheet_name, header_row) as (_, src_rows):
+            for offset, (srow, orow) in enumerate(zip_longest(src_rows, out_rows, fillvalue=())):
+                for out_index, m in enumerate(mappings):
+                    out = at(orow, out_index, EMPTY_CELL)
+                    src = EMPTY_CELL if m.old_index is None else at(srow, m.old_index, EMPTY_CELL)
+                    if not same_cell(src, out):
+                        old_ref = (
+                            "(empty column)" if m.old_index is None
+                            else cell_ref(m.old_index, header_row + 1 + offset)
+                        )
+                        mismatches.append(f"old {old_ref} -> new {cell_ref(out_index, offset + 2)}")
     finally:
-        src_wb.close()
         out_wb.close()
 
     if mismatches:
@@ -338,7 +506,7 @@ def migrate(old_path, helper_path, output_path, sheet_name, header_row, new_shee
     except ValueError as exc:
         raise MigrationError(f"--new-sheet '{new_sheet}' is not a valid sheet name ({exc}).") from None
     try:
-        rows_written, formula_cells, not_migrated, unnamed = write_new_file(
+        rows_written, formula_cells, line_break_cells, not_migrated, unnamed = write_new_file(
             old_path, sheet_name, header_row, mappings, out_ws
         )
     except BaseException:
@@ -369,6 +537,12 @@ def migrate(old_path, helper_path, output_path, sheet_name, header_row, new_shee
         print(f"\nWARNING: old file has data in columns without a header, NOT migrated: {', '.join(unnamed)}")
     if formula_cells:
         print(f"\nNote: {formula_cells} copied cells were formulas in the old file; their results were copied as values.")
+    if line_break_cells:
+        cells = "1 copied cell has" if line_break_cells == 1 else f"{line_break_cells} copied cells have"
+        print(
+            f"\nNote: {cells} text on several lines (for example an address); "
+            "the line breaks were saved as Excel line breaks. The text itself is unchanged."
+        )
 
 
 def ask(question, default=None, shown_default=None):
@@ -391,14 +565,17 @@ def ask_yes_no(question, default):
         print("   Please type y or n.")
 
 
-def ask_xlsx_file(question, default=None, shown_default=None):
+def ask_file(question, suffixes, default=None, shown_default=None):
     while True:
         answer = ask(question, default, shown_default)
         path = Path(answer) if answer else None
         if path is None:
             print("   Please give a file.")
-        elif path.suffix.lower() != ".xlsx":
-            print("   This is not an .xlsx file. An old .xls file must first be opened in Excel and saved as .xlsx.")
+        elif path.suffix.lower() not in suffixes:
+            print(
+                f"   This is not an {' or '.join(suffixes)} file. "
+                "An old .xls file must first be opened in Excel and saved as .xlsx."
+            )
         elif not path.is_file():
             print(f"   File not found: {path}")
         else:
@@ -409,8 +586,9 @@ def ask_for_arguments(default_helper):
     """Build the command-line options by asking step by step. Returns None if the user cancels."""
     print("=" * 70)
     print(" ERP DATA MIGRATION")
-    print(" Copies data from an old Excel file into a new Excel file, using the")
-    print(" column list in the mapping file (data_migration_helper.xlsx).")
+    print(" Copies data from an old Excel file (.xlsx) or text file (.txt) into a")
+    print(" new Excel file, using the column list in the mapping file")
+    print(" (data_migration_helper.xlsx).")
     print()
     print(" Tip: to give a file, drag it from File Explorer into this window and")
     print("      press Enter. Close the Excel files before you start.")
@@ -418,11 +596,9 @@ def ask_for_arguments(default_helper):
     print()
 
     while True:
-        old = ask_xlsx_file("1. Old Excel file (the file that has the data)")
+        old = ask_file("1. Old file, .xlsx or .txt (the file that has the data)", OLD_FILE_TYPES)
         try:
-            wb = open_workbook(old)
-            sheets = wb.sheetnames
-            wb.close()
+            sheets = old_file_sheets(old)
             break
         except MigrationError as exc:
             print(f"   {exc}")
@@ -448,8 +624,9 @@ def ask_for_arguments(default_helper):
         print("   Please type a number, for example 1.")
     argv.append(f"--header-row={header_row}")
 
-    helper = ask_xlsx_file(
+    helper = ask_file(
         "3. Mapping file (press Enter to use the one in this folder)",
+        (".xlsx",),
         default=str(default_helper),
         shown_default=default_helper.name,
     )
@@ -488,9 +665,12 @@ class Parser(argparse.ArgumentParser):
 
 
 HELP_DESCRIPTION = """\
-Copies data from an old Excel file into a new Excel file that has different
-column names. Which old column goes into which new column is written in the
-"Mapping" sheet of data_migration_helper.xlsx.
+Copies data from an old Excel file (.xlsx) or text file (.txt) into a new
+Excel file that has different column names. Which old column goes into which
+new column is written in the "Mapping" sheet of data_migration_helper.xlsx.
+
+A .txt file must have its values separated by tabs. Its values are copied
+as text, exactly as they are written in the file.
 
 Easiest way: type only "python main.py", without any options, and it
 asks you for everything step by step."""
@@ -498,6 +678,9 @@ asks you for everything step by step."""
 HELP_EXAMPLES = r"""examples:
   Copy the data from old_data.xlsx into a new file called new_data.xlsx:
     python main.py --old "C:\Data\old_data.xlsx" --output "C:\Data\new_data.xlsx"
+
+  The old data is a text file (.txt) instead of an Excel file:
+    python main.py --old "C:\Data\CUSTOMER.TXT" --output "C:\Data\new_customers.xlsx"
 
   The old file has several sheets; take the data from the sheet "Customers":
     python main.py --old "old_data.xlsx" --sheet "Customers" --output "new_data.xlsx"
@@ -523,14 +706,16 @@ def build_parser(default_helper):
     )
     must = parser.add_argument_group("you must give")
     must.add_argument("--old", required=True, type=Path, metavar="FILE",
-                      help="The old Excel file (.xlsx) that has the data.")
+                      help="The old file that has the data: an Excel file (.xlsx) "
+                           "or a text file (.txt) with its values separated by tabs.")
     must.add_argument("--output", required=True, type=Path, metavar="FILE",
                       help="The new Excel file to create, for example new_data.xlsx. "
                            "It must not exist yet (see --overwrite).")
     extra = parser.add_argument_group("extra options (use them only when needed)")
     extra.add_argument("--sheet", metavar="NAME",
                        help="Name of the sheet (tab at the bottom in Excel) in the old file to take the data from. "
-                            "Needed only when the old file has more than one sheet.")
+                            "Needed only when the old Excel file has more than one sheet. "
+                            "Not used for a .txt file.")
     extra.add_argument("--header-row", type=int, default=1, metavar="N",
                        help="Row number in the old file that has the column names. Default: 1.")
     extra.add_argument("--helper", type=Path, default=default_helper, metavar="FILE",
@@ -573,6 +758,8 @@ def main(argv=None):
             raise MigrationError(f"output folder does not exist: {args.output.parent}")
         if args.header_row < 1:
             raise MigrationError("--header-row must be 1 or more.")
+        if args.sheet and is_text_file(args.old):
+            raise MigrationError("--sheet is only for Excel files. A .txt file has no sheets, so leave --sheet out.")
         migrate(args.old, args.helper, args.output, args.sheet, args.header_row, args.new_sheet)
     except MigrationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
