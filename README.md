@@ -12,7 +12,7 @@ The old file is never changed.
 - `main.py`: the tool itself. Do not change it.
 - `data_migration_helper.xlsx`: the list of which old column goes into which new column. You fill it in.
 - `requirements.txt`: the list of packages the tool needs.
-- `test_data`: practice files with invented data.
+- `test_data`: practice files with invented data in `test_data\input`, and an empty `test_data\output` folder for the practice result.
 - `README.md` and `ERP_Data_Migration_User_Guide.pdf`: the instructions. Each update brings the newest version.
 - `.git` (a hidden folder) and `.gitignore`: Git uses these to keep track of updates. Do not delete or change them.
 
@@ -263,15 +263,15 @@ Only with a text file (`.txt`):
 
 ## Practice with the test files
 
-The `test_data` folder has practice files with **invented** data. In the Command Prompt, with the environment turned on, type:
+The `test_data\input` folder has practice files with **invented** data. In the Command Prompt, with the environment turned on, type:
 
 ```
-python main.py --old test_data\old_erp_data.xlsx --helper test_data\test_mapping_helper.xlsx --output test_data\practice_result.xlsx
+python main.py --old test_data\input\old_erp_data.xlsx --helper test_data\input\test_mapping_helper.xlsx --output test_data\output\practice_result.xlsx
 ```
 
-Open `test_data\practice_result.xlsx` next to `test_data\expected_new_erp_data.xlsx`. Both should have the same data. The summary should say 15 rows, `branch` left empty, and `Sales Rep, Internal Notes` NOT migrated. The Notes column of `test_mapping_helper.xlsx` explains what each row tests.
+Open `test_data\output\practice_result.xlsx` next to `test_data\input\expected_new_erp_data.xlsx`. Both should have the same data. The summary should say 15 rows, `branch` left empty, and `Sales Rep, Internal Notes` NOT migrated. The Notes column of `test_mapping_helper.xlsx` explains what each row tests.
 
-To run the practice again, delete `test_data\practice_result.xlsx` first, or add `--overwrite`.
+To run the practice again, delete `test_data\output\practice_result.xlsx` first, or add `--overwrite`.
 
 
 ## Get updates
